@@ -1,0 +1,270 @@
+#########################################################################
+### CODIGO PARA A ELABORACAO DO DESENHO AMOSTRAL DO PROJETO PAISAGENS ###
+### AUTOR: ANDERSON SALDANHA BUENO ######################################
+### DATA: 2025-06-20 ####################################################
+#########################################################################
+
+# Limpa a area de trabalho
+remove(list = ls())
+
+# Define a area de trabalho
+setwd("G:/My Drive/Pesquisa/Orientacoes/Gabriel Brutti")
+
+# Remove a notacao cientifica
+options(scipen = 999)
+
+# Carrega os pacotes
+library(terra)
+library(landscapemetrics)
+library(vegan)
+library(ggplot2)
+library(ggpubr)
+library(plotly)
+
+### SHAPEFILE ###
+# Importa o shapefile dos municipios do RS do site do IBGE
+# URL
+url = "https://geoftp.ibge.gov.br/organizacao_do_territorio/malhas_territoriais/malhas_municipais/municipio_2024/UFs/RS/RS_Municipios_2024.zip"
+
+# Baixa o shapefile dos municipios do RS
+rs_zip = download.file(url, destfile = "./municipios_rs.zip", mode = "wb")
+
+# Descompacta o shapefile zipado
+unzip("municipios_rs.zip")
+
+# Deleta o shapefile zipado
+file.remove("municipios_rs.zip")
+
+# Importa o shapefile descompactado
+rs = vect("RS_Municipios_2024.shp")
+
+# Seleciona os municipios que compoe a area de estudo (ae)
+ae = rs[which(rs$NM_MUN == "Independência" |
+                rs$NM_MUN == "Santa Rosa" |
+                rs$NM_MUN == "Senador Salgado Filho" |
+                rs$NM_MUN == "Giruá" |
+                rs$NM_MUN == "Três de Maio" |
+                rs$NM_MUN == "Tuparendi" |
+                rs$NM_MUN == "Cândido Godói" |
+                rs$NM_MUN == "Santo Cristo"), ]
+
+# Converte o shapefile da area de estudo em WGS 84
+ae = project(ae, "EPSG:4326")
+
+
+### RASTER ###
+# Importa o raster do mapbiomas - 10m, colecao 2, ano 2023
+# O raster ja esta cortado para a area de estudo
+# Disponivel no GitHub
+mapbiomas = rast("https://raw.githubusercontent.com/buenoas/paisagens/main/mapbiomas_10m_col2_2023_noroeste_rs.tif")
+
+# Visualiza area de estudo com os municipios
+plot(mapbiomas)
+plot(ae, add = TRUE)
+
+# Extrai os fragmentos do raster usando a regra da torre (rock)
+fragmentos_raster = get_patches(mapbiomas, class = 3, directions = 4)
+
+# Converte raster em poligono
+fragmentos = as.polygons(fragmentos_raster$layer_1$class_3)
+
+# Converte o shapefile dos fragmentos em UTM 21 S
+fragmentos = project(fragmentos, "EPSG:32721")
+
+# Calcula a area dos fragmentos (ha)
+fragmentos$area_ha = expanse(fragmentos, unit = "ha")
+
+# Calcula a area dos fragmentos (m2)
+fragmentos$area_m2 = expanse(fragmentos)
+
+# Calculate o perimetro dos fragmentos (m)
+fragmentos$perimetro_m = perim(fragmentos)
+
+# Calcula o shape index dos fragmentos
+fragmentos$shape = (fragmentos$perimetro_m * 0.25) / sqrt(fragmentos$area_m2)
+
+# Mantem apenas os fragmentos entre 6 e 7 ha
+# e com indice de forma menor ou igual a 4
+fragmentos = subset(fragmentos,
+                    fragmentos$area_ha >= 6 &
+                      fragmentos$area_ha <= 7 &
+                      fragmentos$shape <= 4)
+
+# Cria um buffer em torno dos fragmentos
+fragmentos_buffer = buffer(fragmentos, width = 1000)
+
+# Criar um buraco no buffer (buffer - fragmento)
+buffer_sem_fragmento = list()
+
+for (i in 1:nrow(fragmentos)) {
+  
+  buffer_sem_fragmento[[i]] = erase(fragmentos_buffer[i, ] - fragmentos[i, ])
+  print(i)
+  
+}
+
+# Converte lista em data frame
+buffer_sem_fragmento = do.call(rbind, buffer_sem_fragmento)
+
+# Converte o shapefile dos buffers em WGS 84
+buffer_sem_fragmento_wgs84 = project(buffer_sem_fragmento, "EPSG:4326")
+
+
+# Importa o raster do mapbiomas - 10m, colecao 2, ano 2023
+# O raster ja esta cortado para a area de estudo e POSSUI 2 km de buffer
+# Disponivel no GitHub
+mapbiomas_2km = rast("https://raw.githubusercontent.com/buenoas/paisagens/main/mapbiomas_10m_col2_2023_noroeste_rs_2km.tif")
+
+
+# Calcula a porcentagem de cada categoria de uso da terra no entorno dos fragmentos
+# Calcula a diversidade de categorias de uso da terra no entorno dos fragmentos (matriz) sem considerar a cobertura florestal
+cobertura = list()
+div_paisagem_com_floresta = list()
+div_paisagem_sem_floresta = list()
+
+for (i in 1:nrow(buffer_sem_fragmento_wgs84)) {
+  
+  mapbiomas_crop = crop(mapbiomas_2km, buffer_sem_fragmento_wgs84[i, ])
+  mapbiomas_mask = mask(mapbiomas_crop, buffer_sem_fragmento_wgs84[i, ])
+  
+  pixels = table(values(mapbiomas_mask))
+  cobertura[[i]] = pixels / sum(pixels) * 100
+  div_paisagem_com_floresta[[i]] = diversity(pixels)
+  
+  pixels_sem_floresta = pixels[-which(names(pixels) == "3")]
+  div_paisagem_sem_floresta[[i]] = diversity(pixels_sem_floresta)
+  
+  print(i)
+  
+}
+
+# Adiciona uma coluna com a porcentagem de floresta
+# em torno de cada fragmento ate 1 km da borda
+fragmentos$floresta_porcentagem = unlist(lapply(cobertura, function(x) x["3"]))
+
+# Adiciona uma coluna com a diversidade da paisagem
+# em torno de cada fragmento ate 1 km da borda (sem considerando a floresta)
+fragmentos$div_paisagem_sem_floresta = unlist(div_paisagem_sem_floresta)
+
+# Adiciona uma coluna com a diversidade da paisagem
+# em torno de cada fragmento ate 1 km da borda (considerando a a floresta)
+fragmentos$div_paisagem_com_floresta = unlist(div_paisagem_com_floresta)
+
+# Faz uma copia do shapefile com 265 fragmentos
+fragmentos_265 = fragmentos
+
+# Adiciona uma coluna com os fragmentos selecionados
+# 40 fragmentos selecionados, dos 265
+# Aqui esta o resultado da selecao, que envolveu varias etapas, especialmente a inspecao de um grafico entre indice de forma (y) e cobertura florestal (x)
+# O objetivo foi selecionar fragmentos que cobrirem o maior gradiente de cobertura florestal possivel e duas categorias de indice de forma: regular (< 2.33) e irregular (> 2.84)
+selecao_40 = c(1, 8, 12, 22, 25, 36, 41, 42, 46, 56, 60, 63, 69, 70, 71, 76, 77, 88, 109, 131, 132, 136, 139, 140, 141, 153, 157, 159, 164, 180, 181, 197, 227, 228, 240, 247, 251, 253, 262, 263)
+
+# Adiciona a coluna "selecao" no shapefile
+fragmentos$selecao = FALSE
+fragmentos$selecao[selecao_40] = TRUE
+
+# Salva o shapefile dos fragmentos com tamanho entre 6 e 7 ha
+writeVector(fragmentos, "fragmentos_265_6-7ha_1000m.shp", overwrite = TRUE)
+
+# Mantem apenas os fragmentos selecionados
+fragmentos = fragmentos[selecao_40, ]
+
+### PRODUZ UM MAPA DE CADA PAISAGEM ###
+# Importa a tabela de cores
+colors_df = read.csv("Codigos-da-legenda-colecao-9.csv", sep = "\t", stringsAsFactors = FALSE)
+
+#for (i in 1:nrow(buffer_sem_fragmento_wgs84)) {
+for (i in selecao_40) {  
+  
+  m = mask(crop(mapbiomas_2km, buffer_sem_fragmento_wgs84[i, ]),
+           buffer_sem_fragmento_wgs84[i, ])
+  
+  # Converte o raster para data.frame e junta com a legenda
+  m_df = merge(as.data.frame(m, xy = TRUE, na.rm = TRUE), colors_df, by.x = names(m), by.y = "Class_ID")
+  
+  # Calcula a porcentagem de cada classe na paisagem
+  bar_data = aggregate(rep(1, nrow(m_df)), by = list(m_df$Descricao), FUN = length)
+  colnames(bar_data) = c("Descricao", "count")
+  bar_data$percentage = 100 * bar_data$count / sum(bar_data$count)
+  
+  # Junta com as cores e ordena da maior para a menor
+  bar_data = merge(bar_data, colors_df[, c("Descricao", "Color")], by = "Descricao")
+  bar_data = bar_data[order(-bar_data$percentage), ]
+  
+  # Define os rótulos da legenda com porcentagem
+  legend_labels = paste0(bar_data$Descricao, " (", round(bar_data$percentage, 1), "%)")
+  
+  # Ajusta os níveis do fator para controlar a ordem da legenda
+  m_df$Descricao = factor(m_df$Descricao, levels = bar_data$Descricao)
+  
+  # Diferenca na latitude
+  dif_x = (max(m_df$x) - min(m_df$x))/4
+  dif_y = (max(m_df$y) - min(m_df$y))/4
+  
+  # Gera o mapa
+  g = 
+    
+    ggplot(m_df) +
+    geom_rect(
+      xmin = min(m_df$x)+dif_x, xmax = max(m_df$x)-dif_x,
+      ymin = min(m_df$y)+dif_y, ymax = max(m_df$y)-dif_y,
+      fill = "black") +
+    geom_raster(aes(x = x, y = y, fill = Descricao)) +
+    scale_fill_manual(values = setNames(bar_data$Color, bar_data$Descricao),
+                      breaks = bar_data$Descricao,
+                      labels = legend_labels) +
+    coord_fixed() +
+    labs(title = paste0("Paisagem #", i), fill = NULL,
+         caption = paste0("Área = ", round(as.data.frame(fragmentos_265)[i,"area_ha"], 2), " ha", " | Índice de forma = ", round(as.data.frame(fragmentos_265)[i,"shape"], 2))) +
+    theme_void() +
+    theme(plot.title = element_text(hjust = 0.5),
+          plot.caption = element_text(hjust = 0.5))
+  
+  
+  # Salva as paisagens
+  ggsave(g, filename = paste0("./paisagens/paisagem_", i, ".jpg"),
+         w = 10*1.5, h = 10, units = "cm")
+  
+  print(i)
+  
+}
+
+
+# Grafico para explorar os pontos a serem selecionados
+# Prepara os dados
+# s = subconjunto de fragmentos
+s = as.data.frame(fragmentos)
+
+# Cria duas categorias de indice de forma (shape index)
+s$shape_cat = NA
+s$shape_cat[s$shape < 2.33] = "regular"
+s$shape_cat[s$shape > 2.84] = "irregular"
+
+# Produz o grafico
+p = 
+  ggplot(data = s[order(s$floresta_porcentagem,
+                        s$area_ha), ],
+         aes(x = floresta_porcentagem,
+             y = shape,
+             fill = shape_cat)) +
+  labs(y = "Índice de forma",
+       x = "Cobertura florestal no entorno de 1 km (%)",
+       fill = "Categoria da forma",
+       title = paste0("Fragmentos florestais entre 6 e 7 ha", " (n = ", nrow(s), ")")) +
+  scale_y_continuous(limits = c(1, 4),
+                     breaks = 1:4) +
+  geom_vline(xintercept = seq(0, 45, 5),
+             linetype = "dashed", colour = "grey") +
+  geom_point(shape = 21, size = 2.5, stroke = 1/3,
+             colour = "black") +
+  theme_pubr() +
+  theme(plot.title = element_text(hjust = 0.5),
+        legend.position = "none")
+
+p
+
+ggsave(p, filename = "fragmentos_selecionados.png", dpi = 600,
+       width = 14*1.5, height = 14, units = "cm")
+
+# Produz o grafico interativo
+ggplotly(p)
